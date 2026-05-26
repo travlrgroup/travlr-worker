@@ -1,4 +1,4 @@
-// TRAVLR Price Comparison Worker v4.4.0
+// TRAVLR Price Comparison Worker v4.4.1
 // Sources:
 //   Agoda    — Affiliate Lite API v2 (direct, real prices, geo search)
 //   Booking  — booking-com15.p.rapidapi.com (RapidAPI, name search)
@@ -23,7 +23,7 @@
 //   - Updated Expedia credentials (PROD key)
 //   - lat/lng still optional (geocoding fallback from v4.3.0 retained)
 
-var WORKER_VERSION = "4.4.0";
+var WORKER_VERSION = "4.4.1";
 var CACHE_TTL_SECONDS = 900; // 15 minutes
 var FX_CACHE_TTL_SECONDS = 3600; // 1 hour for FX rates
 
@@ -470,12 +470,6 @@ async function handleRates(request, env) {
     await rateCache.put(cacheKey, JSON.stringify(responseData), { expirationTtl: CACHE_TTL_SECONDS });
   }
 
-  // ── Log analytics (non-blocking) ────────────────────────────────────────────
-  if (analyticsKv) {
-    const analyticsData = { ...responseData, partnerId };
-    logImpression(analyticsData, analyticsKv); // intentionally not awaited
-  }
-
   return jsonResponse(responseData, 200, origin, env, false);
 }
 
@@ -530,7 +524,7 @@ async function handleAnalytics(request, env) {
 
 // ─── FETCH HANDLER ────────────────────────────────────────────────────────────
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "*";
 
@@ -542,8 +536,21 @@ export default {
     }
 
     switch (url.pathname) {
-      case "/rates":
-        return handleRates(request, env);
+      case "/rates": {
+        const response = await handleRates(request, env);
+        // Analytics: log impression after response is ready, using waitUntil so it
+        // completes even after the response is sent back to the client.
+        if (env.ANALYTICS && url.pathname === "/rates") {
+          const p = url.searchParams;
+          const partnerId = p.get("partnerId") || p.get("data-partner-id") || "unknown";
+          ctx.waitUntil(
+            response.clone().json().then(data =>
+              logImpression({ ...data, partnerId }, env.ANALYTICS)
+            ).catch(() => {})
+          );
+        }
+        return response;
+      }
       case "/analytics":
         return handleAnalytics(request, env);
       case "/health":
