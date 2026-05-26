@@ -1,18 +1,24 @@
-// TRAVLR Price Comparison Worker v4.2.0
+// TRAVLR Price Comparison Worker v4.3.0
 // Sources:
-//   Agoda    — Affiliate Lite API v2 (direct, real prices)
-//   Booking  — booking-com15.p.rapidapi.com (RapidAPI, real prices)
-//   Expedia  — Expedia Rapid API v3 (direct, real prices, CID 506148)
+//   Agoda    — Affiliate Lite API v2 (direct, real prices, geo search)
+//   Booking  — booking-com15.p.rapidapi.com (RapidAPI, name search)
+//   Expedia  — Expedia Rapid API v3 (direct, real prices, geo search)
 //
-// Secrets required:
+// Secrets required (set via wrangler secret put):
 //   AGODA_API_KEY       = "1966074:<your-agoda-api-key>"
 //   RAPIDAPI_KEY        = RapidAPI key for booking-com15
 //   EXPEDIA_API_KEY     = Expedia Rapid API key
 //   EXPEDIA_API_SECRET  = Expedia Rapid API shared secret
 //   EXPEDIA_CID         = "506148"
 //   ALLOWED_ORIGINS     = "*" or comma-separated list
+//
+// Changes in v4.3.0:
+//   - lat/lng are now OPTIONAL. When missing, geocoding is attempted via
+//     Nominatim (OSM) using the hotel name. Agoda + Expedia (geo-based) will
+//     still work as long as geocoding resolves. Booking.com always works
+//     (name-based search). No more 400 errors for missing lat/lng.
 
-var WORKER_VERSION = "4.2.0";
+var WORKER_VERSION = "4.3.0";
 var CACHE_TTL = 300; // 5 minutes
 
 function corsHeaders(origin, env) {
@@ -51,11 +57,36 @@ function fuzzyMatch(name, query) {
   return words.filter(w => n.includes(w)).length / words.length;
 }
 
+// ─── GEOCODE ──────────────────────────────────────────────────────────────────
+// Resolve lat/lng from hotel name using Nominatim (OSM) — free, no key needed.
+// Returns { lat, lng } or null.
+async function geocodeHotel(hotelName) {
+  if (!hotelName) return null;
+  try {
+    const qs = new URLSearchParams({
+      q: hotelName,
+      format: "json",
+      limit: "1",
+      addressdetails: "0"
+    });
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?${qs}`, {
+      headers: { "User-Agent": "TRAVLR-Widget/4.3.0 (travlr.com)" }
+    });
+    if (!res.ok) return null;
+    const results = await res.json();
+    if (!results.length) return null;
+    return { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) };
+  } catch (e) {
+    console.log("Geocode error:", e.message);
+    return null;
+  }
+}
+
 // ─── AGODA ────────────────────────────────────────────────────────────────────
 // Affiliate Lite API v2 — geo search, returns real prices + affiliate URLs
 async function fetchAgoda(params, key) {
   const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
-  if (!key) return null;
+  if (!key || !lat || !lng) return null;
 
   try {
     const body = {
@@ -115,9 +146,9 @@ async function fetchAgoda(params, key) {
 }
 
 // ─── BOOKING.COM ──────────────────────────────────────────────────────────────
-// booking-com15.p.rapidapi.com — real prices via RapidAPI
+// booking-com15.p.rapidapi.com — real prices via RapidAPI (name-based, no geo needed)
 async function fetchBooking(params, rapidApiKey) {
-  const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
+  const { hotelName, checkIn, checkOut, adults, currency, nights } = params;
   if (!rapidApiKey) return null;
 
   try {
@@ -215,7 +246,7 @@ async function fetchBooking(params, rapidApiKey) {
 // Expedia Rapid API v3 — direct, real prices, CID 506148 for affiliate tracking
 async function fetchExpedia(params, apiKey, apiSecret, cid) {
   const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
-  if (!apiKey || !apiSecret) return null;
+  if (!apiKey || !apiSecret || !lat || !lng) return null;
 
   try {
     const ts = Math.floor(Date.now() / 1000);
@@ -308,20 +339,31 @@ async function handleRates(request, env) {
   const currency = (p.get("currency") || "AUD").toUpperCase();
   const adults = parseInt(p.get("adults") || "2", 10);
   const travlrPrice = p.get("travlrPrice") ? parseFloat(p.get("travlrPrice")) : null;
-  const lat = parseFloat(p.get("lat") || "0");
-  const lng = parseFloat(p.get("lng") || "0");
+
+  // lat/lng are optional — attempt geocoding if missing
+  let lat = parseFloat(p.get("lat") || "0") || null;
+  let lng = parseFloat(p.get("lng") || "0") || null;
 
   if (!checkIn || !checkOut) {
     return jsonResponse({ error: "checkIn and checkOut are required" }, 400, origin, env);
   }
+
+  // If no coordinates provided, try geocoding from hotel name
   if (!lat || !lng) {
-    return jsonResponse({ error: "lat and lng are required for price lookup" }, 400, origin, env);
+    const geo = await geocodeHotel(hotelName);
+    if (geo) {
+      lat = geo.lat;
+      lng = geo.lng;
+      console.log(`Geocoded "${hotelName}" → ${lat}, ${lng}`);
+    } else {
+      console.log(`Could not geocode "${hotelName}" — geo-based OTAs will be skipped`);
+    }
   }
 
   const nights = getNights(checkIn, checkOut);
   const params = { hotelName, hotelCode, lat, lng, checkIn, checkOut, adults, currency, nights };
 
-  // Fire all OTA calls in parallel — gracefully skip if credentials missing
+  // Fire all OTA calls in parallel — gracefully skip if credentials or geo missing
   const [agodaResult, bookingResult, expediaResult] = await Promise.allSettled([
     fetchAgoda(params, env.AGODA_API_KEY),
     fetchBooking(params, env.RAPIDAPI_KEY),
@@ -356,7 +398,8 @@ async function handleRates(request, env) {
       timestamp: new Date().toISOString(),
       source: "Direct OTA APIs",
       otas: ["agoda", "booking", "expedia"],
-      activeOtas: rates.map(r => r.ota)
+      activeOtas: rates.map(r => r.ota),
+      geocoded: (!p.get("lat") && lat) ? true : false
     }
   }, 200, origin, env);
 }
