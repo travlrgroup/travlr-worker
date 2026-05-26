@@ -1,8 +1,9 @@
-// TRAVLR Price Comparison Worker v4.4.1
+// TRAVLR Price Comparison Worker v4.5.0
 // Sources:
 //   Agoda    — Affiliate Lite API v2 (direct, real prices, geo search)
 //   Booking  — booking-com15.p.rapidapi.com (RapidAPI, name search)
 //   Expedia  — Expedia Rapid API v3 (direct, real prices, geo search)
+//   Trip.com — Affiliate deep link (Alliance ID 8295694, SID 314523700)
 //
 // Secrets required (set via wrangler secret put):
 //   AGODA_API_KEY       = "1966074:<key>"
@@ -16,14 +17,13 @@
 //   RATE_CACHE    — 15-minute response cache keyed by request params
 //   ANALYTICS     — per-impression event log (hotel, OTAs, prices, savings)
 //
-// Changes in v4.4.0:
-//   - KV caching: 15-minute TTL on /rates responses — cuts API costs, ~100ms hits
-//   - FX conversion: all OTA prices normalised to requested currency via exchangerate-api
-//   - Analytics: every impression logged to KV with hotel, OTA prices, savings, partner
-//   - Updated Expedia credentials (PROD key)
-//   - lat/lng still optional (geocoding fallback from v4.3.0 retained)
+// Changes in v4.5.0:
+//   - Trip.com added as affiliate deep link row (no live price, isAffiliateLinkOnly: true)
+//   - Deep link: trip.com/hotels/detail with hotelId, dates, adults, currency + affiliate IDs
+//   - Fallback: trip.com hotel search by name when no hotelId provided
+//   - Changes in v4.4.0 retained: KV caching, FX conversion, analytics, Expedia credentials
 
-var WORKER_VERSION = "4.4.1";
+var WORKER_VERSION = "4.5.0";
 var CACHE_TTL_SECONDS = 900; // 15 minutes
 var FX_CACHE_TTL_SECONDS = 3600; // 1 hour for FX rates
 
@@ -286,6 +286,59 @@ async function fetchBooking(params, rapidApiKey, kv) {
   }
 }
 
+// ─── TRIP.COM ─────────────────────────────────────────────────────────────────
+// Trip.com does not offer a public real-time price API for third parties.
+// We add a deep link row with affiliate tracking so the widget shows Trip.com
+// as an option and earns commission on resulting bookings.
+// Alliance ID: 8295694 | SID: 314523700
+function buildTripComResult(params) {
+  const { hotelCode, hotelName, checkIn, checkOut, adults, currency } = params;
+  const ALLIANCE_ID = "8295694";
+  const SID = "314523700";
+
+  let bookingUrl;
+  if (hotelCode) {
+    // Direct hotel detail page with dates pre-filled
+    const qs = new URLSearchParams({
+      hotelId: hotelCode,
+      checkIn,
+      checkOut,
+      adult: String(adults),
+      currency,
+      Allianceid: ALLIANCE_ID,
+      SID,
+      trip_sub1: hotelName || "",
+      trip_sub3: "D17385475"
+    });
+    bookingUrl = `https://www.trip.com/hotels/detail/?${qs}`;
+  } else {
+    // Search results page by hotel name
+    const qs = new URLSearchParams({
+      keyword: hotelName || "",
+      checkIn,
+      checkOut,
+      adult: String(adults),
+      currency,
+      Allianceid: ALLIANCE_ID,
+      SID,
+      trip_sub1: hotelName || "",
+      trip_sub3: "D17385475"
+    });
+    bookingUrl = `https://www.trip.com/hotels/list?${qs}`;
+  }
+
+  return {
+    ota: "tripcom",
+    name: "Trip.com",
+    pricePerNight: null,
+    totalPrice: null,
+    currency,
+    bookingUrl,
+    isAffiliateLinkOnly: true,
+    affiliateNote: "Price shown on Trip.com — click to view"
+  };
+}
+
 // ─── EXPEDIA ──────────────────────────────────────────────────────────────────
 async function fetchExpedia(params, apiKey, apiSecret, cid, kv) {
   const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
@@ -431,10 +484,14 @@ async function handleRates(request, env) {
     fetchExpedia(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, env.EXPEDIA_CID, rateCache)
   ]);
 
+  // Trip.com is always added as an affiliate deep link (no API call needed)
+  const tripComResult = buildTripComResult(params);
+
   const rates = [
     agodaResult.status === "fulfilled" ? agodaResult.value : null,
     bookingResult.status === "fulfilled" ? bookingResult.value : null,
-    expediaResult.status === "fulfilled" ? expediaResult.value : null
+    expediaResult.status === "fulfilled" ? expediaResult.value : null,
+    tripComResult
   ].filter(Boolean);
 
   const cheapestOta = rates.length ? Math.min(...rates.map(r => r.totalPrice)) : null;
@@ -458,7 +515,7 @@ async function handleRates(request, env) {
       version: WORKER_VERSION,
       timestamp: new Date().toISOString(),
       source: "Direct OTA APIs",
-      otas: ["agoda", "booking", "expedia"],
+      otas: ["agoda", "booking", "expedia", "tripcom"],
       activeOtas: rates.map(r => r.ota),
       geocoded,
       cached: false
@@ -557,7 +614,7 @@ export default {
         return jsonResponse({
           status: "ok",
           version: WORKER_VERSION,
-          dataSource: "Agoda Affiliate Lite API + Booking.com RapidAPI + Expedia Rapid API",
+          dataSource: "Agoda Affiliate Lite API + Booking.com RapidAPI + Expedia Rapid API + Trip.com Affiliate",
           features: ["kv-caching", "fx-conversion", "analytics-logging"],
           cacheTtl: `${CACHE_TTL_SECONDS}s`,
           pricing: "All prices converted to requested currency. Total stay, apples to apples.",
