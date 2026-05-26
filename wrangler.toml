@@ -1,0 +1,33 @@
+# TRAVLR Widget API — Cloudflare Worker config
+# Version: 4.2.0 — Direct OTA APIs (Agoda Affiliate Lite, Booking.com RapidAPI, Expedia Rapid API)
+#
+# Deploy:
+#   npx wrangler deploy --env production
+#
+# Secrets (REQUIRED — set once via wrangler CLI):
+#   npx wrangler secret put AGODA_API_KEY --env production
+#   npx wrangler secret put RAPIDAPI_KEY --env production
+#   npx wrangler secret put EXPEDIA_API_KEY --env production
+#   npx wrangler secret put EXPEDIA_API_SECRET --env production
+#   npx wrangler secret put EXPEDIA_CID --env production
+#
+# CI/CD: GitHub Actions auto-deploys on push to main (see .github/workflows/deploy.yml)
+
+name = "travlr-widget-api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Default vars ──────────────────────────────────────────────────────────────
+[vars]
+ALLOWED_ORIGINS = "*"
+
+# ── Staging ───────────────────────────────────────────────────────────────────
+[env.staging]
+name = "travlr-widget-api-staging"
+vars = { ALLOWED_ORIGINS = "*" }
+
+# ── Production ────────────────────────────────────────────────────────────────
+[env.production]
+name = "travlr-widget-api-production"
+vars = { ALLOWED_ORIGINS = "*" }
