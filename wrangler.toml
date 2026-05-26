@@ -1,5 +1,5 @@
 # TRAVLR Widget API — Cloudflare Worker config
-# Version: 4.2.0 — Direct OTA APIs (Agoda Affiliate Lite, Booking.com RapidAPI, Expedia Rapid API)
+# Version: 4.3.0 — lat/lng optional with geocoding fallback, deploys to staging + production
 #
 # Deploy:
 #   npx wrangler deploy --env production

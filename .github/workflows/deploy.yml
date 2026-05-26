@@ -24,6 +24,13 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Deploy to Cloudflare Workers (staging)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --env staging
+
       - name: Deploy to Cloudflare Workers (production)
         uses: cloudflare/wrangler-action@v3
         with:
