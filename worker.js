@@ -1,26 +1,33 @@
-// TRAVLR Price Comparison Worker v4.3.0
+// TRAVLR Price Comparison Worker v4.4.0
 // Sources:
 //   Agoda    — Affiliate Lite API v2 (direct, real prices, geo search)
 //   Booking  — booking-com15.p.rapidapi.com (RapidAPI, name search)
 //   Expedia  — Expedia Rapid API v3 (direct, real prices, geo search)
 //
 // Secrets required (set via wrangler secret put):
-//   AGODA_API_KEY       = "1966074:<your-agoda-api-key>"
+//   AGODA_API_KEY       = "1966074:<key>"
 //   RAPIDAPI_KEY        = RapidAPI key for booking-com15
-//   EXPEDIA_API_KEY     = Expedia Rapid API key
-//   EXPEDIA_API_SECRET  = Expedia Rapid API shared secret
+//   EXPEDIA_API_KEY     = "6et1fpoohvst2hia477rrjutrr"
+//   EXPEDIA_API_SECRET  = "34nhge23111i6"
 //   EXPEDIA_CID         = "506148"
 //   ALLOWED_ORIGINS     = "*" or comma-separated list
 //
-// Changes in v4.3.0:
-//   - lat/lng are now OPTIONAL. When missing, geocoding is attempted via
-//     Nominatim (OSM) using the hotel name. Agoda + Expedia (geo-based) will
-//     still work as long as geocoding resolves. Booking.com always works
-//     (name-based search). No more 400 errors for missing lat/lng.
+// KV Bindings required (set in wrangler.toml):
+//   RATE_CACHE    — 15-minute response cache keyed by request params
+//   ANALYTICS     — per-impression event log (hotel, OTAs, prices, savings)
+//
+// Changes in v4.4.0:
+//   - KV caching: 15-minute TTL on /rates responses — cuts API costs, ~100ms hits
+//   - FX conversion: all OTA prices normalised to requested currency via exchangerate-api
+//   - Analytics: every impression logged to KV with hotel, OTA prices, savings, partner
+//   - Updated Expedia credentials (PROD key)
+//   - lat/lng still optional (geocoding fallback from v4.3.0 retained)
 
-var WORKER_VERSION = "4.3.0";
-var CACHE_TTL = 300; // 5 minutes
+var WORKER_VERSION = "4.4.0";
+var CACHE_TTL_SECONDS = 900; // 15 minutes
+var FX_CACHE_TTL_SECONDS = 3600; // 1 hour for FX rates
 
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 function corsHeaders(origin, env) {
   const allowed = (env.ALLOWED_ORIGINS || "*").split(",").map(s => s.trim());
   const isAllowed = allowed.includes("*") || allowed.includes(origin);
@@ -33,15 +40,14 @@ function corsHeaders(origin, env) {
   };
 }
 
-function jsonResponse(data, status, origin, env) {
-  return new Response(JSON.stringify(data), {
-    status: status || 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": `public, max-age=${CACHE_TTL}`,
-      ...corsHeaders(origin || "*", env || {})
-    }
-  });
+function jsonResponse(data, status, origin, env, cached) {
+  const headers = {
+    "Content-Type": "application/json",
+    "Cache-Control": `public, max-age=${CACHE_TTL_SECONDS}`,
+    "X-Cache": cached ? "HIT" : "MISS",
+    ...corsHeaders(origin || "*", env || {})
+  };
+  return new Response(JSON.stringify(data), { status: status || 200, headers });
 }
 
 function getNights(checkIn, checkOut) {
@@ -57,20 +63,48 @@ function fuzzyMatch(name, query) {
   return words.filter(w => n.includes(w)).length / words.length;
 }
 
+// ─── FX CONVERSION ────────────────────────────────────────────────────────────
+// Uses exchangerate-api.com open endpoint (no key needed, free tier).
+// Caches rates in KV for 1 hour to avoid hammering the API.
+async function getFxRates(baseCurrency, targetCurrency, kv) {
+  if (baseCurrency === targetCurrency) return 1.0;
+
+  const cacheKey = `fx:${baseCurrency}:${targetCurrency}`;
+  if (kv) {
+    const cached = await kv.get(cacheKey);
+    if (cached) return parseFloat(cached);
+  }
+
+  try {
+    const res = await fetch(`https://open.er-api.com/v6/latest/${baseCurrency}`);
+    if (!res.ok) return 1.0;
+    const data = await res.json();
+    const rate = data.rates?.[targetCurrency];
+    if (!rate) return 1.0;
+
+    if (kv) {
+      await kv.put(cacheKey, String(rate), { expirationTtl: FX_CACHE_TTL_SECONDS });
+    }
+    return rate;
+  } catch (e) {
+    console.log("FX error:", e.message);
+    return 1.0;
+  }
+}
+
+async function convertPrice(amount, fromCurrency, toCurrency, kv) {
+  if (!amount || fromCurrency === toCurrency) return amount;
+  const rate = await getFxRates(fromCurrency, toCurrency, kv);
+  return Math.round(amount * rate);
+}
+
 // ─── GEOCODE ──────────────────────────────────────────────────────────────────
-// Resolve lat/lng from hotel name using Nominatim (OSM) — free, no key needed.
-// Returns { lat, lng } or null.
 async function geocodeHotel(hotelName) {
   if (!hotelName) return null;
   try {
-    const qs = new URLSearchParams({
-      q: hotelName,
-      format: "json",
-      limit: "1",
-      addressdetails: "0"
-    });
+    const qs = new URLSearchParams({ q: hotelName, format: "json", limit: "1", addressdetails: "0" });
     const res = await fetch(`https://nominatim.openstreetmap.org/search?${qs}`, {
-      headers: { "User-Agent": "TRAVLR-Widget/4.3.0 (travlr.com)" }
+      headers: { "User-Agent": "TRAVLR-Widget/4.4.0 (travlr.com)" }
     });
     if (!res.ok) return null;
     const results = await res.json();
@@ -82,9 +116,40 @@ async function geocodeHotel(hotelName) {
   }
 }
 
+// ─── ANALYTICS ────────────────────────────────────────────────────────────────
+// Logs each widget impression to KV. Key: analytics:{timestamp}:{hotelCode}
+// Value: JSON event with hotel, rates, savings, partner, currency.
+// Non-blocking — fires and forgets, never delays the response.
+async function logImpression(data, kv) {
+  if (!kv) return;
+  try {
+    const key = `analytics:${Date.now()}:${data.hotelCode || data.hotelSlug || "unknown"}`;
+    const event = {
+      ts: new Date().toISOString(),
+      hotelCode: data.hotelCode,
+      hotelSlug: data.hotelSlug,
+      hotelName: data.hotelName,
+      checkIn: data.checkIn,
+      checkOut: data.checkOut,
+      nights: data.nights,
+      currency: data.currency,
+      travlrPrice: data.travlrPrice,
+      savings: data.savings,
+      rateCount: data.rateCount,
+      activeOtas: data.meta?.activeOtas || [],
+      rates: (data.rates || []).map(r => ({ ota: r.ota, totalPrice: r.totalPrice, currency: r.currency })),
+      partnerId: data.partnerId,
+      version: WORKER_VERSION
+    };
+    // TTL: 90 days — enough for trend analysis without unbounded growth
+    await kv.put(key, JSON.stringify(event), { expirationTtl: 90 * 24 * 3600 });
+  } catch (e) {
+    console.log("Analytics log error:", e.message);
+  }
+}
+
 // ─── AGODA ────────────────────────────────────────────────────────────────────
-// Affiliate Lite API v2 — geo search, returns real prices + affiliate URLs
-async function fetchAgoda(params, key) {
+async function fetchAgoda(params, key, kv) {
   const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
   if (!key || !lat || !lng) return null;
 
@@ -104,10 +169,7 @@ async function fetchAgoda(params, key) {
 
     const res = await fetch("https://affiliateapi7643.agoda.com/affiliateservice/lt_v1", {
       method: "POST",
-      headers: {
-        "Authorization": key,
-        "Content-Type": "application/json"
-      },
+      headers: { "Authorization": key, "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
 
@@ -120,9 +182,7 @@ async function fetchAgoda(params, key) {
     const hotels = data.results || data.result?.hotels || [];
     if (!hotels.length) return null;
 
-    // Find best match by hotel name
-    let best = hotels[0];
-    let bestScore = 0;
+    let best = hotels[0], bestScore = 0;
     for (const h of hotels) {
       const score = fuzzyMatch(h.hotelName || "", hotelName);
       if (score > bestScore) { bestScore = score; best = h; }
@@ -130,13 +190,19 @@ async function fetchAgoda(params, key) {
 
     if (!best.dailyRate) return null;
 
+    const otaCurrency = best.currency || currency;
+    const rawTotal = Math.round(best.dailyRate * nights);
+    const convertedTotal = await convertPrice(rawTotal, otaCurrency, currency, kv);
+    const convertedPerNight = Math.round(convertedTotal / nights);
+
     return {
       ota: "agoda",
       name: "Agoda",
-      pricePerNight: Math.round(best.dailyRate),
-      totalPrice: Math.round(best.dailyRate * nights),
-      currency: best.currency || currency,
-      bookingUrl: best.landingURL || `https://www.agoda.com/partners/partnersearch.aspx?cid=1807881&hid=${best.hotelId}`,
+      pricePerNight: convertedPerNight,
+      totalPrice: convertedTotal,
+      currency,
+      originalCurrency: otaCurrency !== currency ? otaCurrency : undefined,
+      bookingUrl: best.landingURL || `https://www.agoda.com/partners/partnersearch.aspx?cid=1807881&hid=${best.hotelId}&currency=${currency}&checkin=${checkIn}&checkout=${checkOut}&NumberofAdults=${adults}&NumberofChildren=0&Rooms=1`,
       hotelName: best.hotelName
     };
   } catch (e) {
@@ -146,44 +212,27 @@ async function fetchAgoda(params, key) {
 }
 
 // ─── BOOKING.COM ──────────────────────────────────────────────────────────────
-// booking-com15.p.rapidapi.com — real prices via RapidAPI (name-based, no geo needed)
-async function fetchBooking(params, rapidApiKey) {
+async function fetchBooking(params, rapidApiKey, kv) {
   const { hotelName, checkIn, checkOut, adults, currency, nights } = params;
   if (!rapidApiKey) return null;
 
   try {
     const HOST = "booking-com15.p.rapidapi.com";
 
-    // Step 1: Search destination to get dest_id
     const destRes = await fetch(
       `https://${HOST}/api/v1/hotels/searchDestination?query=${encodeURIComponent(hotelName)}`,
-      {
-        headers: {
-          "X-RapidAPI-Key": rapidApiKey,
-          "X-RapidAPI-Host": HOST
-        }
-      }
+      { headers: { "X-RapidAPI-Key": rapidApiKey, "X-RapidAPI-Host": HOST } }
     );
-
-    if (!destRes.ok) {
-      console.log(`Booking dest search ${destRes.status}`);
-      return null;
-    }
+    if (!destRes.ok) { console.log(`Booking dest ${destRes.status}`); return null; }
 
     const destData = await destRes.json();
     const destinations = destData.data || [];
-
-    // Find a hotel-type destination
     const hotelDest = destinations.find(d => d.dest_type === "hotel") || destinations[0];
     if (!hotelDest) return null;
 
-    const destId = hotelDest.dest_id;
-    const destType = hotelDest.dest_type || "city";
-
-    // Step 2: Search hotel availability
     const searchQs = new URLSearchParams({
-      dest_id: destId,
-      search_type: destType,
+      dest_id: hotelDest.dest_id,
+      search_type: hotelDest.dest_type || "city",
       arrival_date: checkIn,
       departure_date: checkOut,
       adults: String(adults),
@@ -197,42 +246,37 @@ async function fetchBooking(params, rapidApiKey) {
 
     const hotelsRes = await fetch(
       `https://${HOST}/api/v1/hotels/searchHotels?${searchQs}`,
-      {
-        headers: {
-          "X-RapidAPI-Key": rapidApiKey,
-          "X-RapidAPI-Host": HOST
-        }
-      }
+      { headers: { "X-RapidAPI-Key": rapidApiKey, "X-RapidAPI-Host": HOST } }
     );
-
-    if (!hotelsRes.ok) {
-      console.log(`Booking search ${hotelsRes.status}`);
-      return null;
-    }
+    if (!hotelsRes.ok) { console.log(`Booking search ${hotelsRes.status}`); return null; }
 
     const hotelsData = await hotelsRes.json();
     const hotels = hotelsData.data?.hotels || [];
     if (!hotels.length) return null;
 
-    // Find best match
-    let best = hotels[0];
-    let bestScore = 0;
+    let best = hotels[0], bestScore = 0;
     for (const h of hotels) {
       const score = fuzzyMatch(h.property?.name || "", hotelName);
       if (score > bestScore) { bestScore = score; best = h; }
     }
 
-    const totalPrice = best.property?.priceBreakdown?.grossPrice?.value;
-    if (!totalPrice) return null;
+    const grossPrice = best.property?.priceBreakdown?.grossPrice;
+    const rawTotal = grossPrice?.value;
+    if (!rawTotal) return null;
 
-    const bookingUrl = `https://www.booking.com/hotel/${best.property?.countryCode?.toLowerCase() || ""}/${best.property?.id}.html?checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&currency=${currency}`;
+    const otaCurrency = grossPrice?.currency || currency;
+    const convertedTotal = await convertPrice(Math.round(rawTotal), otaCurrency, currency, kv);
+
+    const countryCode = best.property?.countryCode?.toLowerCase() || "";
+    const bookingUrl = `https://www.booking.com/hotel/${countryCode}/${best.property?.id}.html?checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&currency=${currency}`;
 
     return {
       ota: "booking",
       name: "Booking.com",
-      pricePerNight: Math.round(totalPrice / nights),
-      totalPrice: Math.round(totalPrice),
+      pricePerNight: Math.round(convertedTotal / nights),
+      totalPrice: convertedTotal,
       currency,
+      originalCurrency: otaCurrency !== currency ? otaCurrency : undefined,
       bookingUrl,
       hotelName: best.property?.name
     };
@@ -243,8 +287,7 @@ async function fetchBooking(params, rapidApiKey) {
 }
 
 // ─── EXPEDIA ──────────────────────────────────────────────────────────────────
-// Expedia Rapid API v3 — direct, real prices, CID 506148 for affiliate tracking
-async function fetchExpedia(params, apiKey, apiSecret, cid) {
+async function fetchExpedia(params, apiKey, apiSecret, cid, kv) {
   const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
   if (!apiKey || !apiSecret || !lat || !lng) return null;
 
@@ -255,7 +298,6 @@ async function fetchExpedia(params, apiKey, apiSecret, cid) {
     const sig = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
     const authHeader = `EAN apikey=${apiKey},signature=${sig},timestamp=${ts}`;
 
-    // Search properties by geo
     const searchQs = new URLSearchParams({
       language: "en-US",
       supply_source: "expedia",
@@ -283,15 +325,14 @@ async function fetchExpedia(params, apiKey, apiSecret, cid) {
     });
 
     if (!res.ok) {
-      console.log(`Expedia ${res.status}: ${await res.text().then(t => t.slice(0, 100))}`);
+      console.log(`Expedia ${res.status}: ${await res.text().then(t => t.slice(0, 200))}`);
       return null;
     }
 
     const properties = await res.json();
     if (!Array.isArray(properties) || !properties.length) return null;
 
-    let best = properties[0];
-    let bestScore = 0;
+    let best = properties[0], bestScore = 0;
     for (const p of properties) {
       const score = fuzzyMatch(p.property?.name || "", hotelName);
       if (score > bestScore) { bestScore = score; best = p; }
@@ -300,10 +341,12 @@ async function fetchExpedia(params, apiKey, apiSecret, cid) {
     const room = best.rooms?.[0];
     const rate = room?.rates?.[0];
     const pricing = rate?.occupancy_pricing?.[`${adults}`];
-    const totalPrice = pricing?.totals?.inclusive?.billable_currency?.value
+    const rawTotal = pricing?.totals?.inclusive?.billable_currency?.value
       || pricing?.totals?.gross?.value;
+    if (!rawTotal) return null;
 
-    if (!totalPrice) return null;
+    const otaCurrency = pricing?.totals?.inclusive?.billable_currency?.currency || currency;
+    const convertedTotal = await convertPrice(Math.round(parseFloat(rawTotal)), otaCurrency, currency, kv);
 
     const propId = best.property?.id;
     const affiliateCid = cid || "506148";
@@ -312,9 +355,10 @@ async function fetchExpedia(params, apiKey, apiSecret, cid) {
     return {
       ota: "expedia",
       name: "Expedia",
-      pricePerNight: Math.round(parseFloat(totalPrice) / nights),
-      totalPrice: Math.round(parseFloat(totalPrice)),
+      pricePerNight: Math.round(convertedTotal / nights),
+      totalPrice: convertedTotal,
       currency,
+      originalCurrency: otaCurrency !== currency ? otaCurrency : undefined,
       bookingUrl,
       hotelName: best.property?.name
     };
@@ -339,8 +383,8 @@ async function handleRates(request, env) {
   const currency = (p.get("currency") || "AUD").toUpperCase();
   const adults = parseInt(p.get("adults") || "2", 10);
   const travlrPrice = p.get("travlrPrice") ? parseFloat(p.get("travlrPrice")) : null;
+  const partnerId = p.get("partnerId") || p.get("data-partner-id") || "unknown";
 
-  // lat/lng are optional — attempt geocoding if missing
   let lat = parseFloat(p.get("lat") || "0") || null;
   let lng = parseFloat(p.get("lng") || "0") || null;
 
@@ -348,26 +392,43 @@ async function handleRates(request, env) {
     return jsonResponse({ error: "checkIn and checkOut are required" }, 400, origin, env);
   }
 
-  // If no coordinates provided, try geocoding from hotel name
+  // ── KV Cache check ──────────────────────────────────────────────────────────
+  const cacheKey = `rates:${hotelCode || hotelSlug}:${checkIn}:${checkOut}:${adults}:${currency}:${lat || ""}:${lng || ""}`;
+  const rateCache = env.RATE_CACHE;
+
+  if (rateCache) {
+    const cached = await rateCache.get(cacheKey);
+    if (cached) {
+      const data = JSON.parse(cached);
+      data.meta.cached = true;
+      data.meta.cacheKey = cacheKey;
+      return jsonResponse(data, 200, origin, env, true);
+    }
+  }
+
+  // ── Geocode if no lat/lng ───────────────────────────────────────────────────
+  let geocoded = false;
   if (!lat || !lng) {
     const geo = await geocodeHotel(hotelName);
     if (geo) {
       lat = geo.lat;
       lng = geo.lng;
+      geocoded = true;
       console.log(`Geocoded "${hotelName}" → ${lat}, ${lng}`);
     } else {
-      console.log(`Could not geocode "${hotelName}" — geo-based OTAs will be skipped`);
+      console.log(`Could not geocode "${hotelName}" — geo-based OTAs skipped`);
     }
   }
 
   const nights = getNights(checkIn, checkOut);
   const params = { hotelName, hotelCode, lat, lng, checkIn, checkOut, adults, currency, nights };
+  const analyticsKv = env.ANALYTICS;
 
-  // Fire all OTA calls in parallel — gracefully skip if credentials or geo missing
+  // ── Parallel OTA fetch ──────────────────────────────────────────────────────
   const [agodaResult, bookingResult, expediaResult] = await Promise.allSettled([
-    fetchAgoda(params, env.AGODA_API_KEY),
-    fetchBooking(params, env.RAPIDAPI_KEY),
-    fetchExpedia(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, env.EXPEDIA_CID)
+    fetchAgoda(params, env.AGODA_API_KEY, rateCache),
+    fetchBooking(params, env.RAPIDAPI_KEY, rateCache),
+    fetchExpedia(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, env.EXPEDIA_CID, rateCache)
   ]);
 
   const rates = [
@@ -380,7 +441,7 @@ async function handleRates(request, env) {
   const savings = travlrPrice && cheapestOta && cheapestOta > travlrPrice
     ? Math.round(cheapestOta - travlrPrice) : 0;
 
-  return jsonResponse({
+  const responseData = {
     hotelCode,
     hotelSlug,
     hotelName,
@@ -399,11 +460,75 @@ async function handleRates(request, env) {
       source: "Direct OTA APIs",
       otas: ["agoda", "booking", "expedia"],
       activeOtas: rates.map(r => r.ota),
-      geocoded: (!p.get("lat") && lat) ? true : false
+      geocoded,
+      cached: false
     }
-  }, 200, origin, env);
+  };
+
+  // ── Cache the response ──────────────────────────────────────────────────────
+  if (rateCache && rates.length > 0) {
+    await rateCache.put(cacheKey, JSON.stringify(responseData), { expirationTtl: CACHE_TTL_SECONDS });
+  }
+
+  // ── Log analytics (non-blocking) ────────────────────────────────────────────
+  if (analyticsKv) {
+    const analyticsData = { ...responseData, partnerId };
+    logImpression(analyticsData, analyticsKv); // intentionally not awaited
+  }
+
+  return jsonResponse(responseData, 200, origin, env, false);
 }
 
+// ─── ANALYTICS QUERY HANDLER ──────────────────────────────────────────────────
+// GET /analytics?limit=100&partner=playtravel&from=2026-05-01
+// Returns recent impression events for dashboard use.
+async function handleAnalytics(request, env) {
+  const url = new URL(request.url);
+  const origin = request.headers.get("Origin") || "*";
+  const kv = env.ANALYTICS;
+
+  if (!kv) {
+    return jsonResponse({ error: "Analytics not configured" }, 503, origin, env);
+  }
+
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "100"), 500);
+  const partnerFilter = url.searchParams.get("partner") || null;
+
+  try {
+    const list = await kv.list({ prefix: "analytics:", limit });
+    const keys = list.keys || [];
+
+    const events = await Promise.all(
+      keys.map(async k => {
+        const val = await kv.get(k.name);
+        return val ? JSON.parse(val) : null;
+      })
+    );
+
+    const filtered = events
+      .filter(Boolean)
+      .filter(e => !partnerFilter || e.partnerId === partnerFilter)
+      .sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+    // Summary stats
+    const totalImpressions = filtered.length;
+    const avgSavings = filtered.length
+      ? Math.round(filtered.reduce((s, e) => s + (e.savings || 0), 0) / filtered.length)
+      : 0;
+    const otaCounts = {};
+    filtered.forEach(e => (e.activeOtas || []).forEach(ota => { otaCounts[ota] = (otaCounts[ota] || 0) + 1; }));
+
+    return jsonResponse({
+      summary: { totalImpressions, avgSavings, otaCounts },
+      events: filtered
+    }, 200, origin, env);
+  } catch (e) {
+    console.log("Analytics query error:", e.message);
+    return jsonResponse({ error: "Analytics query failed" }, 500, origin, env);
+  }
+}
+
+// ─── FETCH HANDLER ────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -419,16 +544,20 @@ export default {
     switch (url.pathname) {
       case "/rates":
         return handleRates(request, env);
+      case "/analytics":
+        return handleAnalytics(request, env);
       case "/health":
         return jsonResponse({
           status: "ok",
           version: WORKER_VERSION,
           dataSource: "Agoda Affiliate Lite API + Booking.com RapidAPI + Expedia Rapid API",
-          pricing: "All prices are total stay (not per-night). Apples to apples.",
+          features: ["kv-caching", "fx-conversion", "analytics-logging"],
+          cacheTtl: `${CACHE_TTL_SECONDS}s`,
+          pricing: "All prices converted to requested currency. Total stay, apples to apples.",
           timestamp: new Date().toISOString()
         }, 200, origin, env);
       default:
-        return jsonResponse({ error: "Not found", endpoints: ["/rates", "/health"] }, 404, origin, env);
+        return jsonResponse({ error: "Not found", endpoints: ["/rates", "/analytics", "/health"] }, 404, origin, env);
     }
   }
 };

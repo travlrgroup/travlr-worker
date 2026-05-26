@@ -1,7 +1,8 @@
 # TRAVLR Widget API — Cloudflare Worker config
-# Version: 4.3.0 — lat/lng optional with geocoding fallback, deploys to staging + production
+# Version: 4.4.0 — KV caching (15-min TTL), FX conversion, analytics logging
 #
 # Deploy:
+#   npx wrangler deploy --env staging
 #   npx wrangler deploy --env production
 #
 # Secrets (REQUIRED — set once via wrangler CLI):
@@ -11,7 +12,8 @@
 #   npx wrangler secret put EXPEDIA_API_SECRET --env production
 #   npx wrangler secret put EXPEDIA_CID --env production
 #
-# CI/CD: GitHub Actions auto-deploys on push to main (see .github/workflows/deploy.yml)
+# CI/CD: GitHub Actions auto-deploys to staging + production on push to main
+#        See .github/workflows/deploy.yml
 
 name = "travlr-widget-api"
 main = "worker.js"
@@ -22,12 +24,37 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 ALLOWED_ORIGINS = "*"
 
+# ── KV Namespaces (default / dev) ─────────────────────────────────────────────
+[[kv_namespaces]]
+binding = "RATE_CACHE"
+id = "3706f9e73f5044f2bdb2492a67804463"
+
+[[kv_namespaces]]
+binding = "ANALYTICS"
+id = "eb36b57097e54b55b120780cb7a756cd"
+
 # ── Staging ───────────────────────────────────────────────────────────────────
 [env.staging]
 name = "travlr-widget-api-staging"
 vars = { ALLOWED_ORIGINS = "*" }
 
+[[env.staging.kv_namespaces]]
+binding = "RATE_CACHE"
+id = "3706f9e73f5044f2bdb2492a67804463"
+
+[[env.staging.kv_namespaces]]
+binding = "ANALYTICS"
+id = "eb36b57097e54b55b120780cb7a756cd"
+
 # ── Production ────────────────────────────────────────────────────────────────
 [env.production]
 name = "travlr-widget-api-production"
 vars = { ALLOWED_ORIGINS = "*" }
+
+[[env.production.kv_namespaces]]
+binding = "RATE_CACHE"
+id = "3706f9e73f5044f2bdb2492a67804463"
+
+[[env.production.kv_namespaces]]
+binding = "ANALYTICS"
+id = "eb36b57097e54b55b120780cb7a756cd"
