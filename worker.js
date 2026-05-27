@@ -1,9 +1,10 @@
-// TRAVLR Price Comparison Worker v4.5.0
+// TRAVLR Price Comparison Worker v4.6.0
 // Sources:
-//   Agoda    — Affiliate Lite API v2 (direct, real prices, geo search)
-//   Booking  — booking-com15.p.rapidapi.com (RapidAPI, name search)
-//   Expedia  — Expedia Rapid API v3 (direct, real prices, geo search)
-//   Trip.com — Affiliate deep link (Alliance ID 8295694, SID 314523700)
+//   Agoda      — Affiliate Lite API v2 (direct, real prices, geo search)
+//   Booking    — booking-com15.p.rapidapi.com (RapidAPI, name search)
+//   Expedia    — Expedia Rapid API v3, supply_source=expedia (same EPS key/secret)
+//   Hotels.com — Expedia Rapid API v3, supply_source=hotels_com (same EPS key/secret)
+//   Trip.com   — Affiliate deep link (Alliance ID 8295694, SID 314523700)
 //
 // Secrets required (set via wrangler secret put):
 //   AGODA_API_KEY       = "1966074:<key>"
@@ -23,7 +24,7 @@
 //   - Fallback: trip.com hotel search by name when no hotelId provided
 //   - Changes in v4.4.0 retained: KV caching, FX conversion, analytics, Expedia credentials
 
-var WORKER_VERSION = "4.5.0";
+var WORKER_VERSION = "4.6.0";
 var CACHE_TTL_SECONDS = 900; // 15 minutes
 var FX_CACHE_TTL_SECONDS = 3600; // 1 hour for FX rates
 
@@ -421,6 +422,78 @@ async function fetchExpedia(params, apiKey, apiSecret, cid, kv) {
   }
 }
 
+// ─── HOTELS.COM ──────────────────────────────────────────────────────────────
+// Uses the same EPS Rapid API credentials as Expedia, but supply_source=hotels_com.
+async function fetchHotelsCom(params, apiKey, apiSecret, kv) {
+  const { hotelName, lat, lng, checkIn, checkOut, adults, currency, nights } = params;
+  if (!apiKey || !apiSecret || !lat || !lng) return null;
+  try {
+    const ts = Math.floor(Date.now() / 1000);
+    const msgBuf = new TextEncoder().encode(`${apiKey}${apiSecret}${ts}`);
+    const hashBuf = await crypto.subtle.digest("SHA-512", msgBuf);
+    const sig = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    const authHeader = `EAN apikey=${apiKey},signature=${sig},timestamp=${ts}`;
+    const searchQs = new URLSearchParams({
+      language: "en-US",
+      supply_source: "hotels_com",
+      checkin: checkIn,
+      checkout: checkOut,
+      occupancy: `${adults}`,
+      currency,
+      country_code: "AU",
+      sales_channel: "website",
+      sales_environment: "hotel_only",
+      sort_type: "preferred",
+      limit: "10",
+      latitude: String(lat),
+      longitude: String(lng),
+      radius: "3",
+      unit: "km"
+    });
+    const res = await fetch(`https://api.ean.com/v3/properties/availability?${searchQs}`, {
+      headers: {
+        "Authorization": authHeader,
+        "Accept": "application/json",
+        "Partner-Transaction-Id": `travlr-hcom-${Date.now()}`
+      }
+    });
+    if (!res.ok) {
+      console.log(`Hotels.com ${res.status}: ${await res.text().then(t => t.slice(0, 200))}`);
+      return null;
+    }
+    const properties = await res.json();
+    if (!Array.isArray(properties) || !properties.length) return null;
+    let best = properties[0], bestScore = 0;
+    for (const p of properties) {
+      const score = fuzzyMatch(p.property?.name || "", hotelName);
+      if (score > bestScore) { bestScore = score; best = p; }
+    }
+    const room = best.rooms?.[0];
+    const rate = room?.rates?.[0];
+    const pricing = rate?.occupancy_pricing?.[`${adults}`];
+    const rawTotal = pricing?.totals?.inclusive?.billable_currency?.value
+      || pricing?.totals?.gross?.value;
+    if (!rawTotal) return null;
+    const otaCurrency = pricing?.totals?.inclusive?.billable_currency?.currency || currency;
+    const convertedTotal = await convertPrice(Math.round(parseFloat(rawTotal)), otaCurrency, currency, kv);
+    const propId = best.property?.id;
+    const bookingUrl = `https://www.hotels.com/ho${propId}/?q-check-in=${checkIn}&q-check-out=${checkOut}&q-rooms=1&q-room-0-adults=${adults}&AFFCID=506148`;
+    return {
+      ota: "hotelscom",
+      name: "Hotels.com",
+      pricePerNight: Math.round(convertedTotal / nights),
+      totalPrice: convertedTotal,
+      currency,
+      originalCurrency: otaCurrency !== currency ? otaCurrency : undefined,
+      bookingUrl,
+      hotelName: best.property?.name
+    };
+  } catch (e) {
+    console.log("Hotels.com error:", e.message);
+    return null;
+  }
+}
+
 // ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
 async function handleRates(request, env) {
   const url = new URL(request.url);
@@ -478,10 +551,11 @@ async function handleRates(request, env) {
   const analyticsKv = env.ANALYTICS;
 
   // ── Parallel OTA fetch ──────────────────────────────────────────────────────
-  const [agodaResult, bookingResult, expediaResult] = await Promise.allSettled([
+  const [agodaResult, bookingResult, expediaResult, hotelsComResult] = await Promise.allSettled([
     fetchAgoda(params, env.AGODA_API_KEY, rateCache),
     fetchBooking(params, env.RAPIDAPI_KEY, rateCache),
-    fetchExpedia(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, env.EXPEDIA_CID, rateCache)
+    fetchExpedia(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, env.EXPEDIA_CID, rateCache),
+    fetchHotelsCom(params, env.EXPEDIA_API_KEY, env.EXPEDIA_API_SECRET, rateCache)
   ]);
 
   // Trip.com is always added as an affiliate deep link (no API call needed)
@@ -491,6 +565,7 @@ async function handleRates(request, env) {
     agodaResult.status === "fulfilled" ? agodaResult.value : null,
     bookingResult.status === "fulfilled" ? bookingResult.value : null,
     expediaResult.status === "fulfilled" ? expediaResult.value : null,
+    hotelsComResult.status === "fulfilled" ? hotelsComResult.value : null,
     tripComResult
   ].filter(Boolean);
 
@@ -515,7 +590,7 @@ async function handleRates(request, env) {
       version: WORKER_VERSION,
       timestamp: new Date().toISOString(),
       source: "Direct OTA APIs",
-      otas: ["agoda", "booking", "expedia", "tripcom"],
+      otas: ["agoda", "booking", "expedia", "hotelscom", "tripcom"],
       activeOtas: rates.map(r => r.ota),
       geocoded,
       cached: false
@@ -614,7 +689,7 @@ export default {
         return jsonResponse({
           status: "ok",
           version: WORKER_VERSION,
-          dataSource: "Agoda Affiliate Lite API + Booking.com RapidAPI + Expedia Rapid API + Trip.com Affiliate",
+          dataSource: "Agoda Affiliate Lite API + Booking.com RapidAPI + Expedia Rapid API v3 + Hotels.com EPS Rapid API v3 + Trip.com Affiliate",
           features: ["kv-caching", "fx-conversion", "analytics-logging"],
           cacheTtl: `${CACHE_TTL_SECONDS}s`,
           pricing: "All prices converted to requested currency. Total stay, apples to apples.",
