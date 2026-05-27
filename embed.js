@@ -20,7 +20,7 @@
  * All data-* attributes are optional except data-hotel-id.
  * The widget auto-hides if no rates are returned from the API.
  *
- * Changes in v1.4.0:
+ * Changes in v1.5.0:
  *   - Hide widget entirely if no rates returned OR TRAVLR price >= cheapest OTA price
  *   - Widget is invisible to users when it can't show a genuine saving
  *
@@ -428,15 +428,26 @@
   // ─── Build a single OTA row HTML ──────────────────────────────────────────
   // isAffiliateLinkOnly rows (e.g. Trip.com) show "View price →" instead of a price.
   // Live-priced rows show the price + savings badge and are wrapped in an <a> tag.
+  var OTA_BRAND_ICONS = {
+    'Booking.com': 'https://widget.travlr.com/manus-storage/booking_icon_f19331c1.png',
+    'Expedia.com': 'https://widget.travlr.com/manus-storage/expedia_icon_68ae1640.png',
+    'Expedia': 'https://widget.travlr.com/manus-storage/expedia_icon_68ae1640.png',
+    'Trip.com': 'https://widget.travlr.com/manus-storage/tripcom_icon_d7ff815a.png',
+    'Hotels.com': 'https://widget.travlr.com/manus-storage/hotelscom_icon_4d20445e.png',
+    'Agoda.com': 'https://widget.travlr.com/manus-storage/agoda_icon_98e4faca.png',
+    'Agoda': 'https://widget.travlr.com/manus-storage/agoda_icon_98e4faca.png',
+  };
+
   function buildOtaRow(r, savings, n, showSavingsBadge) {
     var isAffiliate = r.isAffiliateLinkOnly === true;
     var savingsBadge = (!isAffiliate && showSavingsBadge && savings && savings > 0)
       ? '<span class="tw-savings-badge">Save ' + formatPrice(savings * n, config.currency) + '</span>'
       : '';
+    var iconSrc = OTA_BRAND_ICONS[r.name] || r.iconUrl || '';
 
     var nameHtml =
       '<div class="tw-ota-info">' +
-        (r.iconUrl ? '<img class="tw-ota-icon" src="' + r.iconUrl + '" alt="' + r.name + '">' : '') +
+        (iconSrc ? '<img class="tw-ota-icon" src="' + iconSrc + '" alt="' + r.name + '">' : '') +
         '<span class="tw-ota-name">' + r.name + '</span>' +
         savingsBadge +
       '</div>';
