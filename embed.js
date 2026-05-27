@@ -1,6 +1,6 @@
 /**
  * TRAVLR Price Confidence Widget — Embed Script
- * Version: 1.3.0
+ * Version: 1.4.0
  *
  * Drop this single script tag onto any hotel detail page:
  *
@@ -19,6 +19,10 @@
  *
  * All data-* attributes are optional except data-hotel-id.
  * The widget auto-hides if no rates are returned from the API.
+ *
+ * Changes in v1.4.0:
+ *   - Hide widget entirely if no rates returned OR TRAVLR price >= cheapest OTA price
+ *   - Widget is invisible to users when it can't show a genuine saving
  *
  * Changes in v1.3.0:
  *   - Auto-reads CheckIn/CheckOut/CurrencyCode/Adults/HotelCode from page URL query params
@@ -472,6 +476,12 @@
     var cheapestOta = livePrices.length ? Math.min.apply(null, livePrices) : null;
     var savings = (travlrTotal && cheapestOta && cheapestOta > travlrTotal)
       ? cheapestOta - travlrTotal : null;
+
+    // Hide widget if TRAVLR price is not cheaper than the cheapest OTA, or no live prices
+    if (!travlrTotal || !cheapestOta || travlrTotal >= cheapestOta) {
+      container.style.display = 'none';
+      return;
+    }
 
     // Prominent savings headline
     var savingsHeadlineHtml = '';
