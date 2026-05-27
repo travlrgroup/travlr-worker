@@ -1,6 +1,6 @@
 /**
  * TRAVLR Price Confidence Widget — Embed Script
- * Version: 1.2.0
+ * Version: 1.3.0
  *
  * Drop this single script tag onto any hotel detail page:
  *
@@ -19,6 +19,12 @@
  *
  * All data-* attributes are optional except data-hotel-id.
  * The widget auto-hides if no rates are returned from the API.
+ *
+ * Changes in v1.3.0:
+ *   - Auto-reads CheckIn/CheckOut/CurrencyCode/Adults/HotelCode from page URL query params
+ *     as fallbacks when data-* attributes are not set (fixes NaN on PlayTravel)
+ *   - Changed "Book direct" to "Save with us" throughout
+ *   - Updated footer: "Prices shown are for 1 room, indicative only..."
  *
  * Changes in v1.2.0:
  *   - Trip.com affiliate deep link row (isAffiliateLinkOnly: true from worker v4.5.0)
@@ -46,13 +52,20 @@
     return match ? match[1] : '';
   }
 
+  // Auto-read URL query params as fallbacks (e.g. PlayTravel passes ?CheckIn=...&CheckOut=...)
+  var _urlParams = new URLSearchParams(window.location.search);
+  function _urlParam(key) {
+    // Support both exact case and common variants (CheckIn / checkIn / check_in)
+    return _urlParams.get(key) || _urlParams.get(key.toLowerCase()) || _urlParams.get(key.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '')) || '';
+  }
+
   var config = {
-    hotelId:      scriptEl.getAttribute('data-hotel-id') || '',
+    hotelId:      scriptEl.getAttribute('data-hotel-id') || _urlParam('HotelCode') || '',
     hotelSlug:    scriptEl.getAttribute('data-hotel-slug') || extractSlugFromUrl(),
-    checkIn:      scriptEl.getAttribute('data-check-in') || '',
-    checkOut:     scriptEl.getAttribute('data-check-out') || '',
-    adults:       parseInt(scriptEl.getAttribute('data-adults') || '2', 10),
-    currency:     scriptEl.getAttribute('data-currency') || 'AUD',
+    checkIn:      scriptEl.getAttribute('data-check-in') || _urlParam('CheckIn') || '',
+    checkOut:     scriptEl.getAttribute('data-check-out') || _urlParam('CheckOut') || '',
+    adults:       parseInt(scriptEl.getAttribute('data-adults') || _urlParam('Adults') || '2', 10),
+    currency:     scriptEl.getAttribute('data-currency') || _urlParam('CurrencyCode') || 'AUD',
     travlrPrice:  parseFloat(scriptEl.getAttribute('data-travlr-price') || '0') || null,
     apiUrl:       (scriptEl.getAttribute('data-api-url') || 'https://travlr-widget-api-production.travlr-widget-api.workers.dev').replace(/\/$/, ''),
     exitIntent:   scriptEl.getAttribute('data-exit-intent') === 'true',
@@ -466,7 +479,7 @@
       savingsHeadlineHtml =
         '<div class="tw-savings-headline">' +
           'Save up to ' + formatPrice(savings, config.currency) + ' here!' +
-          '<div class="tw-savings-headline-sub">Book direct \u2014 don\'t pay more on other sites</div>' +
+          '<div class="tw-savings-headline-sub">Save with us \u2014 don\'t pay more on other sites</div>' +
         '</div>';
     }
 
@@ -480,7 +493,7 @@
         '<div class="tw-travlr-row">' +
           '<div class="tw-travlr-label">' +
             '<div class="tw-travlr-logo">T</div>' +
-            '<div><div class="tw-travlr-name">Book direct</div></div>' +
+            '<div><div class="tw-travlr-name">Save with us</div></div>' +
           '</div>' +
           '<div class="tw-travlr-price">' +
             '<div class="tw-travlr-amount">' + formatPrice(travlrTotal, config.currency) + '</div>' +
@@ -498,7 +511,7 @@
       savingsHeadlineHtml +
       travlrBlock +
       (rates.length ? '<div class="tw-compare-label">Others charge</div>' + otaRows : '') +
-      '<p class="tw-footer">Prices sourced from Agoda, Booking.com, and Trip.com. Affiliate links \u2014 we may earn a commission. Prices confirmed at checkout.</p>';
+      '<p class="tw-footer">Prices shown are for 1 room, indicative only and are sourced from third-party sites.</p>';
   }
 
   // ─── Exit intent popup ────────────────────────────────────────────────────
@@ -528,8 +541,8 @@
         ? 'Wait \u2014 you could save ' + formatPrice(savings, config.currency)
         : 'Wait \u2014 are you sure you want to leave?';
       var sub = savings && savings > 0
-        ? 'You\'re about to miss a saving of ' + formatPrice(savings, config.currency) + ' vs other sites. Book direct and keep the difference.'
-        : 'Book direct and keep the savings.';
+        ? 'You\'re about to miss a saving of ' + formatPrice(savings, config.currency) + ' vs other sites. Save with us and keep the difference.'
+        : 'Save with us and keep the savings.';
 
       var overlay = document.createElement('div');
       overlay.id = 'travlr-exit-intent-overlay';
@@ -549,7 +562,7 @@
         ? '<div class="tw-travlr-row" style="margin-bottom:12px">' +
             '<div class="tw-travlr-label">' +
               '<div class="tw-travlr-logo">T</div>' +
-              '<div><div class="tw-travlr-name">Book direct</div></div>' +
+              '<div><div class="tw-travlr-name">Save with us</div></div>' +
             '</div>' +
             '<div class="tw-travlr-price">' +
               '<div class="tw-travlr-amount">' + formatPrice(travlrTotal, config.currency) + '</div>' +
