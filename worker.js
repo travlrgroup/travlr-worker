@@ -1,4 +1,4 @@
-// TRAVLR Price Comparison Worker v4.6.0
+// TRAVLR Price Comparison Worker v4.7.0
 // Sources:
 //   Agoda      — Affiliate Lite API v2 (direct, real prices, geo search)
 //   Booking    — booking-com15.p.rapidapi.com (RapidAPI, name search)
@@ -268,8 +268,9 @@ async function fetchBooking(params, rapidApiKey, kv) {
     const otaCurrency = grossPrice?.currency || currency;
     const convertedTotal = await convertPrice(Math.round(rawTotal), otaCurrency, currency, kv);
 
-    const countryCode = best.property?.countryCode?.toLowerCase() || "";
-    const bookingUrl = `https://www.booking.com/hotel/${countryCode}/${best.property?.id}.html?checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&currency=${currency}`;
+    // Use hotel_ids redirect — works reliably with numeric dest_id from RapidAPI
+    const hotelId = hotelDest.dest_id || best.property?.id || "";
+    const bookingUrl = `https://www.booking.com/searchresults.html?hotel_ids=${hotelId}&checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&currency=${currency}&aid=356980&label=travlr-widget`;
 
     return {
       ota: "booking",
@@ -404,7 +405,10 @@ async function fetchExpedia(params, apiKey, apiSecret, cid, kv) {
 
     const propId = best.property?.id;
     const affiliateCid = cid || "506148";
-    const bookingUrl = `https://www.expedia.com/h${propId}.Hotel-Information?chkin=${checkIn}&chkout=${checkOut}&rm1=a${adults}&mcicid=${affiliateCid}`;
+    // Expedia URL: /Hotel-Name.h{id}.Hotel-Information — slug is optional, ID is the anchor
+    const expediaSlug = (best.property?.name || "Hotel")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const bookingUrl = `https://www.expedia.com/${expediaSlug}.h${propId}.Hotel-Information?chkin=${checkIn}&chkout=${checkOut}&rm1=a${adults}&AFFCID=${affiliateCid}`;
 
     return {
       ota: "expedia",
@@ -477,7 +481,10 @@ async function fetchHotelsCom(params, apiKey, apiSecret, kv) {
     const otaCurrency = pricing?.totals?.inclusive?.billable_currency?.currency || currency;
     const convertedTotal = await convertPrice(Math.round(parseFloat(rawTotal)), otaCurrency, currency, kv);
     const propId = best.property?.id;
-    const bookingUrl = `https://www.hotels.com/ho${propId}/?q-check-in=${checkIn}&q-check-out=${checkOut}&q-rooms=1&q-room-0-adults=${adults}&AFFCID=506148`;
+    // Hotels.com URL: /ho{id}/ — numeric ID from EPS maps directly to public hotel page
+    const hotelsSlug = (best.property?.name || "Hotel")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const bookingUrl = `https://www.hotels.com/${hotelsSlug}.h${propId}.Hotel-Information?chkin=${checkIn}&chkout=${checkOut}&rm1=a${adults}&AFFCID=506148`;
     return {
       ota: "hotelscom",
       name: "Hotels.com",
